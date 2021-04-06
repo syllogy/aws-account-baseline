@@ -1,0 +1,136 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Baseline - AWS Config
+Metadata:
+  Stack:
+    Value: 0
+  VersionDate:
+    Value: 2020-10-02
+  Identifier:
+    Value: monitoring
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: AWS Config Params
+        Parameters:
+          - pIncludeGlobalResourceTypes
+    ParameterLabels:
+      pIncludeGlobalResourceTypes:
+        default: Include Global Resource Types
+
+Parameters:
+
+  pIncludeGlobalResourceTypes:
+    Description: "Global resources to be included in recorder"
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+Resources:
+
+  rConfigRole:
+    Type: AWS::IAM::Role
+    DependsOn: rConfigBucket
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [config.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSConfigRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetBucketAcl
+                Resource: !Sub arn:${AWS::Partition}:s3:::${rConfigBucket}
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${rConfigBucket}/AWSLogs/${AWS::AccountId}/*
+                Condition:
+                  StringEquals:
+                    s3:x-amz-acl: bucket-owner-full-control
+              - Effect: Allow
+                Action:
+                - config:PutConfigRule
+                - config:PutConfigurationRecorder
+                - config:PutEvaluations
+                - config:PutAggregationAuthorization
+                - config:PutConfigurationAggregator
+                - config:PutDeliveryChannel
+                Resource: '*'
+
+  rDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: One_Hour
+      S3BucketName: !Ref rConfigBucket
+      SnsTopicARN: !Ref rConfigTopic
+
+  rConfigTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "config-topic-${AWS::AccountId}"
+      DisplayName: AWS Config Notification Topic
+      KmsMasterKeyId: "alias/aws/sns"
+
+  rConfigTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id: ConfigTopicPolicy
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: SNS:Publish
+            Resource: '*'
+      Topics:
+        - !Ref rConfigTopic
+
+  rConfigBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "awsconfig-${AWS::Region}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: Transition90daysRetain7yrs
+            Status: Enabled
+            ExpirationInDays: 2555
+            Transition:
+              TransitionInDays: 90
+              StorageClass: GLACIER
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      AccessControl: LogDeliveryWrite
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        LogFilePrefix: access-logs
+
+  rConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: default
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: !Ref pIncludeGlobalResourceTypes
+      RoleARN: !GetAtt rConfigRole.Arn

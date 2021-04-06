@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Baseline - Billing CUR
+
+Metadata:
+  Stack:
+    Value: 0
+  VersionDate:
+    Value: 2020-10-18
+  Identifier:
+    Value: password-policy
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Billing Bucket
+        Parameters:
+          - pManagementIamArn
+      - Label:
+          default: CUR Report Definition
+        Parameters:
+          - pReportName
+          - pTimeUnit
+          - pFormat
+          - pCompression
+          - pS3Prefix
+          - pRefreshClosedReports
+          - pReportVersioning
+    ParameterLabels:
+      pReportName:
+        default: Report Name
+      pTimeUnit:
+        default: Time Unit
+      pFormat:
+        default: Format
+      pCompression:
+        default: Compression
+      pS3Prefix:
+        default: S3 Prefix
+      pRefreshClosedReports:
+        default: Refresh Closed Reports
+      pReportVersioning:
+        default: Report Versioning
+      pManagementIamArn:
+        default: Management Tool IAM ARN
+
+Parameters:
+
+  pReportName:
+    Type: 'String'
+    Description: "The name of the report that you want to create. The name must be unique, is case sensitive, and can't include spaces."
+    Default: "CUR"
+    ConstraintDescription: 'Must be unique name in account'
+  pTimeUnit:
+    Type: 'String'
+    Description: 'The length of time covered by the report.'
+    Default: 'HOURLY'
+    AllowedValues:
+      - "HOURLY"
+      - "DAILY"
+      - "MONTHLY"
+  pFormat:
+    Type: 'String'
+    Description: 'The format that AWS saves the report in.'
+    Default: 'textORcsv'
+    AllowedValues:
+      - "textORcsv"
+      - 'Parquet'
+  pCompression:
+    Type: 'String'
+    Description: 'The compression format that AWS uses for the report.'
+    Default: 'ZIP'
+    AllowedValues:
+      - 'ZIP'
+      - 'GZIP'
+      - 'Parquet'
+  pS3Prefix:
+    Type: 'String'
+    Description: "The prefix that AWS adds to the report name when AWS delivers the report. Your prefix can't include spaces."
+    Default: 'CUR'
+  pRefreshClosedReports:
+    Type: 'String'
+    Description: "Whether you want Amazon Web Services to update your reports after they have been finalized if Amazon Web Services detects charges related to previous months. These charges can include refunds, credits, or support fees."
+    Default: 'True'
+    AllowedValues:
+      - 'True'
+      - 'False'
+  pReportVersioning:
+    Type: 'String'
+    Description: 'Whether you want Amazon Web Services to overwrite the previous version of each report or to deliver the report in addition to the previous versions.'
+    Default: 'CREATE_NEW_REPORT'
+    AllowedValues:
+      - 'CREATE_NEW_REPORT'
+      - 'OVERWRITE_REPORT'
+  pManagementIamArn:
+    Description: The IAM role Id for the role used by your Management Tool
+    Type: String
+    Default: ""
+
+Conditions:
+  cUseManagementIamArn: !Not [!Equals [ !Ref pManagementIamArn, "" ]]
+
+Resources:
+
+  rS3BillingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "billing-cur-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      AccessControl: LogDeliveryWrite
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        LogFilePrefix: access-logs
+
+  rBillingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: !Ref rS3BillingBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowAWSBucketAccess
+            Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action:
+              - s3:GetBucketAcl
+              - s3:GetBucketPolicy
+            Resource: !GetAtt rS3BillingBucket.Arn
+          - Sid: AllowAWSObjectAccess
+            Effect: Allow
+            Principal:
+              Service: billingreports.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${rS3BillingBucket.Arn}/*
+          - Sid: AllowReadFromOnlyAuthPrincipals
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3:ListBucket
+              - s3:GetObject
+              - s3:DeleteBucket
+            Resource:
+              - !GetAtt rS3BillingBucket.Arn
+              - !Sub ${rS3BillingBucket.Arn}/*
+            Condition:
+              StringNotLike:
+                aws:userId:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:root
+                  - !If [ cUseManagementIamArn, !Ref pManagementIamArn, !Ref 'AWS::NoValue' ]
+
+
+  rIAMPasswordPolicy:
+    Type: 'Custom::IAMPolicyResource'
+    Properties:
+      ServiceToken: !GetAtt rIAMPasswordPolicyResource.Arn
+      Region: !Ref "AWS::Region"
+
+  rIAMPasswordPolicyResource:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.7
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt rCurResourceExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          from botocore.exceptions import ClientError
+          import json
+          import cfnresponse
+          iam = boto3.client("cur")
+          # Lambda entry point
+          def lambda_handler(event, context):
+            if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+              res, reason = update_policy()
+            elif event['RequestType'] == 'Delete':
+              res, reason = delete_policy()
+            else:
+              res = False
+              reason = "Unknown operation: " + event['RequestType']
+            responseData = {}
+            responseData['Reason'] = reason
+            if res:
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+            else:
+              cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+
+          def new_cur():
+            try:
+              response = client.put_report_definition(
+                  ReportDefinition={
+                      'ReportName': '${pReportName}',
+                      'TimeUnit': '${pTimeUnit}',
+                      'Format': '${pFormat}',
+                      'Compression': '${pCompression}',
+                      'AdditionalSchemaElements': [
+                          'RESOURCES',
+                      ],
+                      'S3Bucket': '${rS3BillingBucket}',
+                      'S3Prefix': '${pS3Prefix}',
+                      'S3Region':'${AWS::Region}',
+                      'RefreshClosedReports': '${pRefreshClosedReports},
+                      'ReportVersioning': '${pReportVersioning}'
+                  }
+              )
+              return(True, response)
+            except Exception as e:
+              return (False, "Cannot update policy: " + str(e))
+
+          def update_cur():
+            try:
+              response = client.modify_report_definition(
+                  ReportName='${pReportName}'
+                  ReportDefinition={
+                      'ReportName': '${pReportName}',
+                      'TimeUnit': '${pTimeUnit}',
+                      'Format': '${pFormat}',
+                      'Compression': '${pCompression}',
+                      'AdditionalSchemaElements': [
+                          'RESOURCES',
+                      ],
+                      'S3Bucket': '${rS3BillingBucket}',
+                      'S3Prefix': '${pS3Prefix}',
+                      'S3Region':'${AWS::Region}',
+                      'RefreshClosedReports': '${pRefreshClosedReports},
+                      'ReportVersioning': '${pReportVersioning}'
+                  }
+              )
+              return(True, response)
+            except Exception as e:
+              return (False, "Cannot update policy: " + str(e))
+
+          def delete_policy():
+            try:
+              response = client.delete_report_definition(
+                  ReportName='${pReportName}'
+              )
+              return (True, response)
+            except Exception as e:
+              return (False, "Cannot delete CUR: " + str(e))
+
+  rCurResourceExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: IAMPasswordCreatorPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: 'Allow'
+            Action:
+            - 'logs:CreateLogGroup'
+            - 'logs:CreateLogStream'
+            - 'logs:PutLogEvents'
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - iam:GetAccountPasswordPolicy
+              - iam:UpdateAccountPasswordPolicy
+              - iam:DeleteAccountPasswordPolicy
+            Resource: "*"
