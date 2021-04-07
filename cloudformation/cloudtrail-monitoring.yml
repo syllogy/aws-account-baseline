@@ -20,6 +20,7 @@ Resources:
 
   rSecurityAlarmTopic:
     Type: AWS::SNS::Topic
+    #checkov:skip=CKV_AWS_26:topic data needs CMK for CW to work
     Properties:
       Subscription:
       - Endpoint: !Ref pNotifyEmail
